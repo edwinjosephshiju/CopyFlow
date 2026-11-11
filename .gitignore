@@ -1,0 +1,13 @@
+/target/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.tmp
+
+# Training & Host Distillation Pipeline (Not needed by AI Studio Android client)
+distillation-trainer/
+template-layout-cloner/
+template-layout-cloner-skill.zip
+copyflow_agent_prompt.md
+PROMPT.md
