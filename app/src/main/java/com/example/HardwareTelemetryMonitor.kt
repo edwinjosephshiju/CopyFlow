@@ -74,7 +74,7 @@ data class HardwareTelemetrySnapshot(
     val systemAvailRamMb: Int = 0,
     val systemTotalRamMb: Int = 0,
     val isLowMemory: Boolean = false,
-    val githubSyncStatus: String = "Ready (Option #2 GitHub Sync)"
+    val githubSyncStatus: String = "Cloud Firestore Telemetry Sink Ready"
 )
 
 sealed interface GitHubReleaseState {
@@ -196,29 +196,27 @@ class HardwareTelemetryMonitor(context: Context) {
 
     fun getConfiguredGitHubRepo(): String {
         val saved = prefs.getString("github_repo_slug", null)?.trim()
-        if (!saved.isNullOrBlank()) return saved
-        val buildCfgRepo = runCatching { BuildConfig.GITHUB_REPO }.getOrNull()?.trim().orEmpty()
-        return if (buildCfgRepo.isNotBlank() && buildCfgRepo != "YOUR_GITHUB_REPO") {
-            buildCfgRepo
-        } else {
-            "storytold/copyflow"
+        if (!saved.isNullOrBlank() && !saved.equals("storytold/copyflow", ignoreCase = true)) {
+            return saved.removePrefix("https://github.com/")
+                .removePrefix("http://github.com/")
+                .removeSuffix(".git")
+                .trim('/')
         }
+        return "edwinjosephshiju/CopyFlow"
     }
 
     fun setConfiguredGitHubRepo(repoSlug: String) {
-        val cleaned = repoSlug.trim().removePrefix("https://github.com/").trim('/')
+        val cleaned = repoSlug.trim()
+            .removePrefix("https://github.com/")
+            .removePrefix("http://github.com/")
+            .removeSuffix(".git")
+            .trim('/')
         if (cleaned.isNotBlank()) {
             prefs.edit().putString("github_repo_slug", cleaned).apply()
         }
     }
 
-    fun hasConfiguredGitHubToken(): Boolean {
-        val token = runCatching { BuildConfig.GITHUB_TOKEN }.getOrNull()?.trim().orEmpty()
-        return token.isNotBlank() &&
-            token != "YOUR_GITHUB_PAT_HERE" &&
-            token != "YOUR_API_KEY" &&
-            token != "null"
-    }
+    fun hasConfiguredGitHubToken(): Boolean = false
 
     fun onSessionGraphInspected(meta: SessionGraphMetadata) {
         _snapshot.update {
@@ -232,6 +230,10 @@ class HardwareTelemetryMonitor(context: Context) {
     fun onStageChanged(stage: HardwareExecutionStage) {
         currentStage = stage
         _snapshot.update { it.copy(activeStage = stage) }
+    }
+
+    fun setCloudSyncStatus(status: String) {
+        _snapshot.update { it.copy(githubSyncStatus = status) }
     }
 
     fun onTaskRunStarted() {
@@ -521,111 +523,6 @@ class HardwareTelemetryMonitor(context: Context) {
         return root
     }
 
-    /**
-     * Option #2 Automated GitHub Telemetry Sync:
-     * Uploads the structured telemetry JSON bundle directly to the configured GitHub repository
-     * (`PUT https://api.github.com/repos/{owner}/{repo}/contents/telemetry/device_telemetry_{device}.json`)
-     * or creates a GitHub Gist if repository write access is unavailable, using `BuildConfig.GITHUB_TOKEN`.
-     */
-    suspend fun syncTelemetryToGitHub(runs: List<TelemetryRunEntity>): Result<String> = withContext(Dispatchers.IO) {
-        val token = runCatching { BuildConfig.GITHUB_TOKEN }.getOrNull()?.trim().orEmpty()
-        if (!hasConfiguredGitHubToken()) {
-            val msg = "Set GITHUB_TOKEN in the AI Studio Secrets panel (.env) to enable direct GitHub API push, or tap 'Export JSON' to share the telemetry log."
-            _snapshot.update { it.copy(githubSyncStatus = msg) }
-            return@withContext Result.failure(IllegalStateException(msg))
-        }
-
-        val repoSlug = getConfiguredGitHubRepo()
-        _snapshot.update { it.copy(githubSyncStatus = "Syncing telemetry to GitHub ($repoSlug)...") }
-
-        try {
-            val bundleJson = buildTelemetryBundleJson(runs).toString(2)
-            val safeModel = Build.MODEL.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-            val remotePath = "telemetry/copyflow_${safeModel}_latest.json"
-            val contentsUrl = "https://api.github.com/repos/$repoSlug/contents/$remotePath"
-
-            // 1. Check if the file already exists so we can include its `sha` for an atomic update
-            var existingSha: String? = null
-            val getReq = Request.Builder()
-                .url(contentsUrl)
-                .header("Authorization", "Bearer $token")
-                .header("Accept", "application/vnd.github+json")
-                .get()
-                .build()
-
-            httpClient.newCall(getReq).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val bodyStr = resp.body?.string().orEmpty()
-                    existingSha = runCatching { JSONObject(bodyStr).optString("sha", "") }
-                        .getOrNull()
-                        ?.takeIf { it.isNotBlank() }
-                }
-            }
-
-            // 2. PUT the updated telemetry JSON to the GitHub repository
-            val base64Content = Base64.encodeToString(bundleJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            val putBodyJson = JSONObject().apply {
-                put("message", "telemetry(npu): update Hexagon HTP & thermal telemetry from ${Build.MODEL}")
-                put("content", base64Content)
-                if (existingSha != null) {
-                    put("sha", existingSha)
-                }
-            }
-
-            val putReq = Request.Builder()
-                .url(contentsUrl)
-                .header("Authorization", "Bearer $token")
-                .header("Accept", "application/vnd.github+json")
-                .put(putBodyJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-
-            httpClient.newCall(putReq).execute().use { putResp ->
-                if (putResp.isSuccessful) {
-                    val okMsg = "Synced ${runs.size} runs to github.com/$repoSlug/$remotePath"
-                    _snapshot.update { it.copy(githubSyncStatus = okMsg) }
-                    return@withContext Result.success(okMsg)
-                }
-
-                // Fallback to GitHub Gist if the token only has `gist` scope or doesn't have write access to `repoSlug`
-                val gistJson = JSONObject().apply {
-                    put("description", "CopyFlow Hexagon v73 HTP NPU & Thermal Telemetry (${Build.MODEL})")
-                    put("public", false)
-                    put(
-                        "files",
-                        JSONObject().put(
-                            "copyflow_${safeModel}_telemetry.json",
-                            JSONObject().put("content", bundleJson)
-                        )
-                    )
-                }
-                val gistReq = Request.Builder()
-                    .url("https://api.github.com/gists")
-                    .header("Authorization", "Bearer $token")
-                    .header("Accept", "application/vnd.github+json")
-                    .post(gistJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .build()
-
-                httpClient.newCall(gistReq).execute().use { gistResp ->
-                    if (gistResp.isSuccessful) {
-                        val gistUrl = runCatching {
-                            JSONObject(gistResp.body?.string().orEmpty()).optString("html_url", "GitHub Gist")
-                        }.getOrDefault("GitHub Gist")
-                        val gistMsg = "Synced ${runs.size} runs to Gist: $gistUrl"
-                        _snapshot.update { it.copy(githubSyncStatus = gistMsg) }
-                        return@withContext Result.success(gistMsg)
-                    } else {
-                        val errMsg = "GitHub Sync HTTP ${putResp.code}: ${putResp.message}"
-                        _snapshot.update { it.copy(githubSyncStatus = errMsg) }
-                        return@withContext Result.failure(IllegalStateException(errMsg))
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            val errMsg = "GitHub Sync failed: ${e.message}"
-            _snapshot.update { it.copy(githubSyncStatus = errMsg) }
-            Result.failure(e)
-        }
-    }
 
     fun close() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -656,9 +553,13 @@ class GitHubReleaseUpdater(context: Context) {
     val releaseState: StateFlow<GitHubReleaseState> = _releaseState.asStateFlow()
 
     suspend fun checkForUpdates(repoSlug: String) = withContext(Dispatchers.IO) {
-        val cleanedRepo = repoSlug.trim().removePrefix("https://github.com/").trim('/')
+        val cleanedRepo = repoSlug.trim()
+            .removePrefix("https://github.com/")
+            .removePrefix("http://github.com/")
+            .removeSuffix(".git")
+            .trim('/')
         if (cleanedRepo.isBlank() || !cleanedRepo.contains('/')) {
-            _releaseState.value = GitHubReleaseState.Error("Enter a valid GitHub repository slug (e.g., owner/repo).")
+            _releaseState.value = GitHubReleaseState.Error("Enter a valid GitHub repository slug (e.g., edwinjosephshiju/CopyFlow).")
             return@withContext
         }
 
@@ -668,11 +569,6 @@ class GitHubReleaseUpdater(context: Context) {
                 .url("https://api.github.com/repos/$cleanedRepo/releases/latest")
                 .header("Accept", "application/vnd.github+json")
                 .get()
-
-            val token = runCatching { BuildConfig.GITHUB_TOKEN }.getOrNull()?.trim().orEmpty()
-            if (token.isNotBlank() && token != "YOUR_GITHUB_PAT_HERE" && token != "YOUR_API_KEY") {
-                reqBuilder.header("Authorization", "Bearer $token")
-            }
 
             httpClient.newCall(reqBuilder.build()).execute().use { resp ->
                 if (resp.code == 404) {
@@ -755,11 +651,6 @@ class GitHubReleaseUpdater(context: Context) {
             val reqBuilder = Request.Builder()
                 .url(updateInfo.apkDownloadUrl)
                 .get()
-
-            val token = runCatching { BuildConfig.GITHUB_TOKEN }.getOrNull()?.trim().orEmpty()
-            if (token.isNotBlank() && token != "YOUR_GITHUB_PAT_HERE" && token != "YOUR_API_KEY") {
-                reqBuilder.header("Authorization", "Bearer $token")
-            }
 
             httpClient.newCall(reqBuilder.build()).execute().use { resp ->
                 if (!resp.isSuccessful) {

@@ -7,6 +7,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -60,6 +61,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -86,8 +88,9 @@ import org.json.JSONArray
 
 @Composable
 fun TaskModeScreen(
-    modifier: Modifier = Modifier,
-    viewModel: TaskModeViewModel = viewModel()
+    viewModel: TaskModeViewModel,
+    onSignOut: () -> Unit = {},
+    modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -229,7 +232,7 @@ fun TaskModeScreen(
                 // 1b. Live Hexagon v73 HTP NPU Utilization & Thermal Throttling HUD Bar
                 HexagonNpuTelemetryHudBar(
                     telemetry = uiState.telemetrySnapshot,
-                    recordedRunsCount = uiState.telemetryRuns.size,
+                    recordedRunsCount = maxOf(uiState.telemetryRuns.size, uiState.cloudTelemetryRuns.size),
                     onSyncGitHub = viewModel::syncTelemetryToGitHubNow,
                     onExportJson = viewModel::exportAndShareTelemetryJson,
                     onOpenSettings = { viewModel.toggleSettingsModal(true) }
@@ -353,7 +356,11 @@ fun TaskModeScreen(
             onCheckGitHubReleases = viewModel::checkForGitHubReleaseUpdates,
             onDownloadReleaseApk = viewModel::downloadGitHubReleaseApk,
             onInstallReleaseApk = viewModel::installDownloadedReleaseApk,
-            onClearChatHistory = viewModel::clearAllChatHistory
+            onClearChatHistory = viewModel::clearAllChatHistory,
+            onSignOut = {
+                viewModel.toggleSettingsModal(false)
+                onSignOut()
+            }
         )
     }
 }
@@ -378,11 +385,12 @@ private fun CopyFlowEmptyWorkspace(
     ) {
         Spacer(modifier = Modifier.height(8.dp))
 
-        Icon(
-            imageVector = Icons.Outlined.AutoAwesome,
-            contentDescription = null,
-            tint = ArgonCyan,
-            modifier = Modifier.size(38.dp)
+        Image(
+            painter = painterResource(id = R.drawable.ic_copyflow_logo),
+            contentDescription = "CopyFlow Logo",
+            modifier = Modifier
+                .size(64.dp)
+                .clip(RoundedCornerShape(16.dp))
         )
 
         Text(

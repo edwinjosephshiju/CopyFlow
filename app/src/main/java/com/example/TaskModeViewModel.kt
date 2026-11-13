@@ -1,16 +1,19 @@
 package com.example
 
-import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.core.content.FileProvider
-import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.firebase.firestore.FirebaseFirestoreException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -65,9 +68,12 @@ data class CopyFlowUiState(
     val historySearchQuery: String = "",
     val telemetrySnapshot: HardwareTelemetrySnapshot = HardwareTelemetrySnapshot(),
     val telemetryRuns: List<TelemetryRunEntity> = emptyList(),
-    val githubRepoSlug: String = "storytold/copyflow",
+    val cloudTelemetryRuns: List<CloudTelemetryRun> = emptyList(),
+    val signedInUserId: String = "",
+    val signedInUserEmail: String? = null,
+    val githubRepoSlug: String = "edwinjosephshiju/CopyFlow",
     val hasGitHubToken: Boolean = false,
-    val autoSyncTelemetryGitHub: Boolean = false,
+    val autoSyncTelemetryGitHub: Boolean = true,
     val releaseState: GitHubReleaseState = GitHubReleaseState.Idle
 ) {
     val isModelReady: Boolean
@@ -80,9 +86,13 @@ data class CopyFlowUiState(
         get() = activeSessionId ?: draftSandboxId
 }
 
-class TaskModeViewModel(application: Application) : AndroidViewModel(application) {
+class TaskModeViewModel(
+    private val appContext: Context,
+    private val firestoreTelemetryRepo: FirestoreTelemetrySinkRepository,
+    private val currentUserId: String,
+    private val currentUserEmail: String?
+) : ViewModel() {
 
-    private val appContext = application.applicationContext
     private val dao = TaskHistoryDatabase.getInstance(appContext).dao()
     private val modelManager = QwenModelManager(appContext)
     private val qwenEngine = QwenOnnxNpuEngine()
@@ -93,6 +103,8 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
     private val _uiState = MutableStateFlow(
         CopyFlowUiState(
             grantedFolderName = pythonBridge.getGrantedDirectoryName(),
+            signedInUserId = currentUserId,
+            signedInUserEmail = currentUserEmail,
             githubRepoSlug = telemetryMonitor.getConfiguredGitHubRepo(),
             hasGitHubToken = telemetryMonitor.hasConfiguredGitHubToken()
         )
@@ -145,6 +157,27 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
             dao.observeRecentTelemetryRuns().collectLatest { runs ->
                 _uiState.update { it.copy(telemetryRuns = runs) }
             }
+        }
+
+        // Observe real-time Cloud Firestore Telemetry Sink (/users/{uid}/telemetry_runs)
+        viewModelScope.launch {
+            firestoreTelemetryRepo.observeTelemetryRuns()
+                .catch { error ->
+                    val firestoreError = generateSequence(error) { it.cause }
+                        .filterIsInstance<FirebaseFirestoreException>()
+                        .firstOrNull()
+                    if (firestoreError == null && error is CancellationException) throw error
+                    val rootError = firestoreError ?: error
+                    telemetryMonitor.setCloudSyncStatus(
+                        "Firestore Sink Error: ${rootError.message ?: "Unable to observe cloud runs"}"
+                    )
+                }
+                .collectLatest { cloudRuns ->
+                    _uiState.update { it.copy(cloudTelemetryRuns = cloudRuns) }
+                    telemetryMonitor.setCloudSyncStatus(
+                        "Cloud Firestore Sink Active (${cloudRuns.size} cloud runs synced)"
+                    )
+                }
         }
 
         viewModelScope.launch {
@@ -284,12 +317,44 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
 
     fun syncTelemetryToGitHubNow() {
         viewModelScope.launch {
+            telemetryMonitor.setCloudSyncStatus("Syncing runs to Cloud Firestore Telemetry Sink...")
+            // Always capture a live hardware snapshot run when the user taps "Sync to Firestore"
+            val snap = telemetryMonitor.snapshot.value
+            val livePingRun = TelemetryRunEntity(
+                id = UUID.randomUUID().toString(),
+                sessionId = _uiState.value.currentSandboxSessionId,
+                timestamp = System.currentTimeMillis(),
+                socBadge = snap.socBadge,
+                executionProvider = _uiState.value.executionProvider.name,
+                promptTokens = snap.promptTokenCount,
+                generatedTokens = snap.generatedTokenCount,
+                batchTokenizeMs = snap.batchTokenizeLatencyMs,
+                gpuPrefetchMs = snap.gpuEmbedPrefetchLatencyMs,
+                prefillTokPerSec = snap.prefillTokensPerSec,
+                decodeTokPerSec = snap.decodeTokensPerSec,
+                avgNpuStepMs = snap.avgNpuStepLatencyMs,
+                peakNpuUtilPercent = snap.peakNpuUtilizationPercent,
+                thermalStatusLabel = snap.thermalStatusLabel,
+                isThermalThrottling = snap.isThermalThrottling,
+                nativeHeapMb = snap.nativeHeapAllocatedMb,
+                availRamMb = snap.systemAvailRamMb,
+                inspectDurationMs = snap.openXmlInspectDurationMs,
+                cloneDurationMs = snap.openXmlCloneDurationMs,
+                compactedTurns = snap.compactedTurnsArchived,
+                status = "MANUAL_SYNC_SNAPSHOT"
+            )
+            dao.insertTelemetryRun(livePingRun)
+
             val runs = dao.getRecentTelemetryRunsOnce()
-            val result = telemetryMonitor.syncTelemetryToGitHub(runs)
-            result.onSuccess { msg ->
-                Toast.makeText(appContext, msg, Toast.LENGTH_SHORT).show()
+            val result = firestoreTelemetryRepo.syncAllLocalRunsToFirestore(runs)
+            result.onSuccess { count ->
+                val okMsg = "Synced $count telemetry runs to Cloud Firestore (/users/$currentUserId/telemetry_runs)"
+                telemetryMonitor.setCloudSyncStatus(okMsg)
+                Toast.makeText(appContext, okMsg, Toast.LENGTH_SHORT).show()
             }.onFailure { err ->
-                Toast.makeText(appContext, err.message ?: "GitHub Sync failed", Toast.LENGTH_LONG).show()
+                val errMsg = "Firestore Sync failed: ${err.message}"
+                telemetryMonitor.setCloudSyncStatus(errMsg)
+                Toast.makeText(appContext, errMsg, Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -718,15 +783,19 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
         telemetryMonitor.onTaskRunStarted()
         var toolIterations = 0
         val maxToolIterations = 4
-        var inspectedInThisRun = false
+        val hasBothDocs = !templatePath.isNullOrBlank() && !sourcePath.isNullOrBlank()
+        val hasAnyDoc = !templatePath.isNullOrBlank() || !sourcePath.isNullOrBlank()
+        var inspectedInThisRun = hasBothDocs && pythonBridge.hasCachedSandboxInspection(sessionId)
         var clonedInThisRun = false
         var inspectMsInRun = 0L
         var cloneMsInRun = 0L
-        val hasBothDocs = !templatePath.isNullOrBlank() && !sourcePath.isNullOrBlank()
-        val hasAnyDoc = !templatePath.isNullOrBlank() || !sourcePath.isNullOrBlank()
+        var lastCloneVerificationMarkdown = ""
 
         while (toolIterations <= maxToolIterations) {
             val allMessages = dao.getMessagesForSessionOnce(sessionId)
+            val combinedUserInstructions = allMessages
+                .filter { it.role == "user" }
+                .joinToString("\n") { it.content }
             val turns = buildCompactedConversationTurns(
                 allMessages = allMessages,
                 sessionId = sessionId,
@@ -924,11 +993,13 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
                                 specJson = specJsonObj.toString(),
                                 sessionId = sessionId,
                                 fallbackTemplatePath = templatePath,
-                                fallbackSourcePath = sourcePath
+                                fallbackSourcePath = sourcePath,
+                                userChatInstructions = combinedUserInstructions
                             )
                             cloneMsInRun = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                             telemetryMonitor.recordOpenXmlToolDuration("clone_document", cloneMsInRun)
                             clonedInThisRun = true
+                            lastCloneVerificationMarkdown = cloneRes.optString("verification_report_markdown", "")
                             dao.upsertMessage(
                                 ChatMessageEntity(
                                     id = UUID.randomUUID().toString(),
@@ -958,11 +1029,13 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
                                 outputPath = outFile.absolutePath,
                                 sessionId = sessionId,
                                 fallbackTemplatePath = templatePath,
-                                fallbackSourcePath = sourcePath
+                                fallbackSourcePath = sourcePath,
+                                userChatInstructions = combinedUserInstructions
                             )
                             cloneMsInRun = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                             telemetryMonitor.recordOpenXmlToolDuration("run_custom_openxml_python", cloneMsInRun)
                             clonedInThisRun = true
+                            lastCloneVerificationMarkdown = customRes.optString("verification_report_markdown", "")
                             dao.upsertMessage(
                                 ChatMessageEntity(
                                     id = UUID.randomUUID().toString(),
@@ -1015,10 +1088,31 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
                 }
 
                 _uiState.update { it.copy(activeToolBanner = null) }
+                if (clonedInThisRun && lastCloneVerificationMarkdown.isNotBlank()) {
+                    dao.upsertMessage(
+                        ChatMessageEntity(
+                            id = UUID.randomUUID().toString(),
+                            sessionId = sessionId,
+                            role = "assistant",
+                            content = lastCloneVerificationMarkdown,
+                            timestamp = System.currentTimeMillis(),
+                            thoughtText = effectiveToolCall.thoughtText.ifBlank {
+                                "Verified reconstructed OpenXML package, multi-section pagination, dynamic literature expansion, and IEEE citation synchronization."
+                            },
+                            thoughtDurationMs = effectiveToolCall.thoughtDurationMs,
+                            tokensPerSec = finalTps
+                        )
+                    )
+                    break
+                }
                 continue
             }
 
-            val assistantReply = completedEvent?.visibleText?.trim().orEmpty()
+            val assistantReply = if (clonedInThisRun && lastCloneVerificationMarkdown.isNotBlank()) {
+                lastCloneVerificationMarkdown
+            } else {
+                completedEvent?.visibleText?.trim().orEmpty()
+            }
             val assistantThought = completedEvent?.thoughtText?.trim().orEmpty()
             val assistantThoughtMs = completedEvent?.thoughtDurationMs ?: 0L
             if (assistantReply.isNotEmpty() || assistantThought.isNotEmpty()) {
@@ -1090,9 +1184,17 @@ class TaskModeViewModel(application: Application) : AndroidViewModel(application
         )
         dao.insertTelemetryRun(runEntity)
 
-        if (_uiState.value.autoSyncTelemetryGitHub && telemetryMonitor.hasConfiguredGitHubToken()) {
-            val allRuns = dao.getRecentTelemetryRunsOnce()
-            telemetryMonitor.syncTelemetryToGitHub(allRuns)
+        if (_uiState.value.autoSyncTelemetryGitHub) {
+            val cloudRes = firestoreTelemetryRepo.recordTelemetryRun(runEntity)
+            cloudRes.onSuccess { docId ->
+                telemetryMonitor.setCloudSyncStatus(
+                    "Auto-synced run $docId to Cloud Firestore Telemetry Sink"
+                )
+            }.onFailure { err ->
+                telemetryMonitor.setCloudSyncStatus(
+                    "Cloud Firestore auto-sync warning: ${err.message}"
+                )
+            }
         }
     }
 

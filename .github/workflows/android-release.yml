@@ -1,0 +1,129 @@
+name: Build & Publish CopyFlow APK Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "**"
+    tags-ignore:
+      - "v*"
+  repository_dispatch:
+    types:
+      - trigger-apk-release
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: "Optional custom release notes"
+        required: false
+        default: "Automated Google AI Studio USB-compatible APK build (Hexagon v73 HTP NPU + Cloud Firestore Telemetry Sink)."
+
+permissions:
+  contents: write
+
+concurrency:
+  group: copyflow-apk-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Compile AI Studio USB-Compatible APK & Publish Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 21 (Matches Google AI Studio Runtime)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses & Install SDK 36.1 Build Tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36" "platforms;android-36.1" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.3.1 (From gradle-wrapper.properties)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+
+      - name: Restore AI Studio debug.keystore & .env
+        run: |
+          if [ -f "debug.keystore.base64" ]; then
+            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore
+            echo "Restored debug.keystore from debug.keystore.base64 ($(wc -c < debug.keystore) bytes)"
+          else
+            echo "ERROR: debug.keystore.base64 not found in repository root!"
+            exit 1
+          fi
+          if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+            cp -f .env.example .env
+          fi
+
+      - name: Compute Release Version & Tag
+        id: version
+        run: |
+          RUN_NUM="${GITHUB_RUN_NUMBER:-1}"
+          VERSION_NAME="2.0.${RUN_NUM}"
+          VERSION_CODE=$((100 + RUN_NUM))
+          TAG_NAME="v${VERSION_NAME}"
+          APK_FILENAME="CopyFlow-${TAG_NAME}.apk"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=${APK_FILENAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Compile APK (Identical to Google AI Studio USB Build)
+        run: |
+          gradle :app:assembleDebug \
+            -PversionName="${{ steps.version.outputs.version_name }}" \
+            -PversionCode="${{ steps.version.outputs.version_code }}" \
+            --no-daemon
+
+      - name: Package APK & Compute SHA-256 Checksum
+        id: package
+        run: |
+          BUILT_APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$BUILT_APK" ]; then
+            echo "ERROR: Expected APK not found at $BUILT_APK"
+            exit 1
+          fi
+          TARGET_APK="${{ steps.version.outputs.apk_filename }}"
+          cp -f "$BUILT_APK" "$TARGET_APK"
+          SHA256_HASH=$(sha256sum "$TARGET_APK" | awk '{print $1}')
+          echo "$SHA256_HASH  $TARGET_APK" > "${TARGET_APK}.sha256"
+          APK_SIZE_BYTES=$(wc -c < "$TARGET_APK" | tr -d ' ')
+          echo "sha256=${SHA256_HASH}" >> "$GITHUB_OUTPUT"
+          echo "size_bytes=${APK_SIZE_BYTES}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: "CopyFlow ${{ steps.version.outputs.tag_name }}"
+          make_latest: "true"
+          prerelease: false
+          draft: false
+          body: |
+            ## CopyFlow ${{ steps.version.outputs.tag_name }} (AI Studio USB-Compatible Build)
+
+            ${{ github.event.inputs.release_notes || 'Automated build compiled with the identical Google AI Studio debug signing certificate (`debug.keystore.base64`) for seamless USB and in-app self-update installation.' }}
+
+            ### Build Metadata
+            - **Version Name:** `${{ steps.version.outputs.version_name }}`
+            - **Version Code:** `${{ steps.version.outputs.version_code }}`
+            - **Commit:** `${{ github.sha }}`
+            - **APK Asset:** `${{ steps.version.outputs.apk_filename }}` (`${{ steps.version.outputs.size_bytes }}` bytes)
+            - **SHA-256:** `${{ steps.version.outputs.sha256 }}`
+          files: |
+            ${{ steps.version.outputs.apk_filename }}
+            ${{ steps.version.outputs.apk_filename }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

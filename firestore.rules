@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net: Default-deny all unmatched paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Reusable Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isNonNegNumber(val) {
+      return (val is int || val is float) && val >= 0;
+    }
+
+    // 3. TelemetryRun Schema Validation Blueprint
+    function isValidTelemetryRun(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.sessionId is string && data.sessionId.size() >= 1 && data.sessionId.size() <= 128 &&
+             data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 120 &&
+             data.socBadge is string && data.socBadge.size() >= 1 && data.socBadge.size() <= 160 &&
+             data.executionProvider is string && data.executionProvider.size() >= 1 && data.executionProvider.size() <= 80 &&
+             data.promptTokens is int && data.promptTokens >= 0 && data.promptTokens <= 1000000 &&
+             data.generatedTokens is int && data.generatedTokens >= 0 && data.generatedTokens <= 1000000 &&
+             isNonNegNumber(data.batchTokenizeMs) &&
+             isNonNegNumber(data.gpuPrefetchMs) &&
+             isNonNegNumber(data.prefillTokPerSec) &&
+             isNonNegNumber(data.decodeTokPerSec) &&
+             isNonNegNumber(data.avgNpuStepMs) &&
+             data.peakNpuUtilPercent is int && data.peakNpuUtilPercent >= 0 && data.peakNpuUtilPercent <= 100 &&
+             data.thermalStatusLabel is string && data.thermalStatusLabel.size() >= 1 && data.thermalStatusLabel.size() <= 80 &&
+             data.isThermalThrottling is bool &&
+             data.nativeHeapMb is int && data.nativeHeapMb >= 0 && data.nativeHeapMb <= 65536 &&
+             data.availRamMb is int && data.availRamMb >= 0 && data.availRamMb <= 65536 &&
+             data.inspectDurationMs is int && data.inspectDurationMs >= 0 &&
+             data.cloneDurationMs is int && data.cloneDurationMs >= 0 &&
+             data.compactedTurns is int && data.compactedTurns >= 0 &&
+             data.status is string && data.status.size() >= 1 && data.status.size() <= 160 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // 4. User-Scoped Cloud Firestore Telemetry Sink
+    match /users/{userId}/telemetry_runs/{runId} {
+      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(runId);
+      allow list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(userId) &&
+                       isValidId(runId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'sessionId', 'deviceModel', 'socBadge', 'executionProvider',
+                         'promptTokens', 'generatedTokens', 'batchTokenizeMs', 'gpuPrefetchMs',
+                         'prefillTokPerSec', 'decodeTokPerSec', 'avgNpuStepMs', 'peakNpuUtilPercent',
+                         'thermalStatusLabel', 'isThermalThrottling', 'nativeHeapMb', 'availRamMb',
+                         'inspectDurationMs', 'cloneDurationMs', 'compactedTurns', 'status',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'sessionId', 'deviceModel', 'socBadge', 'executionProvider',
+                         'promptTokens', 'generatedTokens', 'batchTokenizeMs', 'gpuPrefetchMs',
+                         'prefillTokPerSec', 'decodeTokPerSec', 'avgNpuStepMs', 'peakNpuUtilPercent',
+                         'thermalStatusLabel', 'isThermalThrottling', 'nativeHeapMb', 'availRamMb',
+                         'inspectDurationMs', 'cloneDurationMs', 'compactedTurns', 'status',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidTelemetryRun(incoming());
+
+      allow update: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(userId) &&
+                       isValidId(runId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'sessionId', 'deviceModel', 'socBadge', 'executionProvider',
+                         'promptTokens', 'generatedTokens', 'batchTokenizeMs', 'gpuPrefetchMs',
+                         'prefillTokPerSec', 'decodeTokPerSec', 'avgNpuStepMs', 'peakNpuUtilPercent',
+                         'thermalStatusLabel', 'isThermalThrottling', 'nativeHeapMb', 'availRamMb',
+                         'inspectDurationMs', 'cloneDurationMs', 'compactedTurns', 'status',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'sessionId', 'deviceModel', 'socBadge', 'executionProvider',
+                         'promptTokens', 'generatedTokens', 'batchTokenizeMs', 'gpuPrefetchMs',
+                         'prefillTokPerSec', 'decodeTokPerSec', 'avgNpuStepMs', 'peakNpuUtilPercent',
+                         'thermalStatusLabel', 'isThermalThrottling', 'nativeHeapMb', 'availRamMb',
+                         'inspectDurationMs', 'cloneDurationMs', 'compactedTurns', 'status',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidTelemetryRun(incoming()) &&
+                       incoming().userId == existing().userId;
+
+      allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(runId);
+    }
+  }
+}

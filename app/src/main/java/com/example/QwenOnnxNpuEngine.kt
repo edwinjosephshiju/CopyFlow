@@ -9,16 +9,21 @@ import ai.onnxruntime.TensorInfo
 import ai.onnxruntime.providers.NNAPIFlags
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.Closeable
@@ -28,10 +33,13 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
+import java.nio.MappedByteBuffer
 import java.nio.ShortBuffer
 import java.nio.channels.FileChannel
 import java.util.EnumSet
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 data class SessionGraphMetadata(
     val detectedSocBadge: String,
@@ -83,11 +91,14 @@ sealed interface GenerationEvent {
 }
 
 /**
- * Lock-free, persistent `FileChannel` 4-bit block-quantized embedding reader for `embed_tokens_q4f16.onnx_data`.
- * Uses positional `FileChannel.read(ByteBuffer, position)` (which is thread-safe and requires zero file seeks
- * or repeated file opens) to execute parallel batch token embedding gather across worker threads.
+ * Zero-syscall `MappedByteBuffer` 4-bit block-quantized embedding engine for `embed_tokens_q4f16.onnx_data`
+ * with a lock-free Hot-Vocabulary Row Cache (`fp16RowCache` / `fp32RowCache`) and dedicated Rolling-Window
+ * parallel batch gather so the Hexagon HTP NPU never waits on disk I/O or thread contention.
  */
-class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
+class DirectQ4F16EmbeddingTable(
+    dataFile: File,
+    private val rollingWindowDispatcher: CoroutineDispatcher
+) : Closeable {
     companion object {
         const val VOCAB_SIZE = 248320
         const val HIDDEN_SIZE = 1024
@@ -98,12 +109,32 @@ class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
         const val ZP_ROW_BYTES = NUM_BLOCKS / 2 // 16
 
         const val QUANT_OFFSET = 0L
+        const val QUANT_TOTAL_BYTES = VOCAB_SIZE.toLong() * QUANT_ROW_BYTES // 127,139,840
         const val SCALES_OFFSET = 127_139_840L
+        const val SCALES_TOTAL_BYTES = VOCAB_SIZE.toLong() * SCALES_ROW_BYTES // 15,892,480
         const val ZP_OFFSET = 143_032_320L
+        const val ZP_TOTAL_BYTES = VOCAB_SIZE.toLong() * ZP_ROW_BYTES // 3,973,120
+
+        private const val MAX_HOT_CACHE_TOKENS = 16_384
     }
 
     private val raf = RandomAccessFile(dataFile, "r")
     private val channel: FileChannel = raf.channel
+
+    // Memory-map the 3 quantized tables directly into OS virtual memory for zero-syscall random access
+    private val quantMapped: MappedByteBuffer? = runCatching {
+        channel.map(FileChannel.MapMode.READ_ONLY, QUANT_OFFSET, QUANT_TOTAL_BYTES)
+    }.getOrNull()
+    private val scalesMapped: MappedByteBuffer? = runCatching {
+        channel.map(FileChannel.MapMode.READ_ONLY, SCALES_OFFSET, SCALES_TOTAL_BYTES)
+    }.getOrNull()
+    private val zpMapped: MappedByteBuffer? = runCatching {
+        channel.map(FileChannel.MapMode.READ_ONLY, ZP_OFFSET, ZP_TOTAL_BYTES)
+    }.getOrNull()
+
+    // Lock-free hot-vocabulary dequantized row caches (eliminates repeated dequantization of prompt/chat tokens)
+    private val fp32RowCache = ConcurrentHashMap<Int, FloatArray>(4096)
+    private val fp16RowCache = ConcurrentHashMap<Int, ShortArray>(4096)
 
     private fun readExactAt(buf: ByteBuffer, offset: Long) {
         buf.clear()
@@ -117,36 +148,135 @@ class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
         buf.flip()
     }
 
-    private fun decodeSingleTokenRowIntoFloat(
+    private fun getOrDecodeFloatRow(
         tokId: Int,
-        outBuf: FloatBuffer,
-        rowBase: Int,
-        quantBuf: ByteBuffer,
-        scalesBuf: ByteBuffer,
-        zpBuf: ByteBuffer
-    ) {
-        val safeId = tokId.coerceIn(0, VOCAB_SIZE - 1).toLong()
-        readExactAt(quantBuf, QUANT_OFFSET + safeId * QUANT_ROW_BYTES)
-        readExactAt(scalesBuf, SCALES_OFFSET + safeId * SCALES_ROW_BYTES)
-        readExactAt(zpBuf, ZP_OFFSET + safeId * ZP_ROW_BYTES)
+        fallbackQuantBuf: ByteBuffer?,
+        fallbackScalesBuf: ByteBuffer?,
+        fallbackZpBuf: ByteBuffer?
+    ): FloatArray {
+        val safeId = tokId.coerceIn(0, VOCAB_SIZE - 1)
+        fp32RowCache[safeId]?.let { return it }
 
-        for (b in 0 until NUM_BLOCKS) {
-            val lo = scalesBuf.get(b * 2).toInt() and 0xFF
-            val hi = scalesBuf.get(b * 2 + 1).toInt() and 0xFF
-            val scaleHalf = (hi shl 8) or lo
-            val scale = halfToFloatStatic(scaleHalf)
+        val row = FloatArray(HIDDEN_SIZE)
+        val qMap = quantMapped
+        val sMap = scalesMapped
+        val zMap = zpMapped
 
-            val zpByte = zpBuf.get(b / 2).toInt() and 0xFF
-            val zp = if (b % 2 == 0) (zpByte and 0x0F) else ((zpByte ushr 4) and 0x0F)
+        if (qMap != null && sMap != null && zMap != null) {
+            val qBase = safeId * QUANT_ROW_BYTES
+            val sBase = safeId * SCALES_ROW_BYTES
+            val zBase = safeId * ZP_ROW_BYTES
 
-            val blockStart = b * BLOCK_SIZE
-            for (j in 0 until BLOCK_SIZE) {
-                val k = blockStart + j
-                val qByte = quantBuf.get(k / 2).toInt() and 0xFF
-                val q = if (k % 2 == 0) (qByte and 0x0F) else ((qByte ushr 4) and 0x0F)
-                outBuf.put(rowBase + k, (q - zp).toFloat() * scale)
+            for (b in 0 until NUM_BLOCKS) {
+                val lo = sMap.get(sBase + b * 2).toInt() and 0xFF
+                val hi = sMap.get(sBase + b * 2 + 1).toInt() and 0xFF
+                val scale = halfToFloatStatic((hi shl 8) or lo)
+
+                val zpByte = zMap.get(zBase + b / 2).toInt() and 0xFF
+                val zp = if (b % 2 == 0) (zpByte and 0x0F) else ((zpByte ushr 4) and 0x0F)
+
+                val blockStart = b * BLOCK_SIZE
+                for (j in 0 until BLOCK_SIZE) {
+                    val k = blockStart + j
+                    val qByte = qMap.get(qBase + k / 2).toInt() and 0xFF
+                    val q = if (k % 2 == 0) (qByte and 0x0F) else ((qByte ushr 4) and 0x0F)
+                    row[k] = (q - zp).toFloat() * scale
+                }
+            }
+        } else {
+            val qBuf = fallbackQuantBuf ?: ByteBuffer.allocateDirect(QUANT_ROW_BYTES)
+            val sBuf = fallbackScalesBuf ?: ByteBuffer.allocateDirect(SCALES_ROW_BYTES)
+            val zBuf = fallbackZpBuf ?: ByteBuffer.allocateDirect(ZP_ROW_BYTES)
+            val idLong = safeId.toLong()
+            readExactAt(qBuf, QUANT_OFFSET + idLong * QUANT_ROW_BYTES)
+            readExactAt(sBuf, SCALES_OFFSET + idLong * SCALES_ROW_BYTES)
+            readExactAt(zBuf, ZP_OFFSET + idLong * ZP_ROW_BYTES)
+
+            for (b in 0 until NUM_BLOCKS) {
+                val lo = sBuf.get(b * 2).toInt() and 0xFF
+                val hi = sBuf.get(b * 2 + 1).toInt() and 0xFF
+                val scale = halfToFloatStatic((hi shl 8) or lo)
+
+                val zpByte = zBuf.get(b / 2).toInt() and 0xFF
+                val zp = if (b % 2 == 0) (zpByte and 0x0F) else ((zpByte ushr 4) and 0x0F)
+
+                val blockStart = b * BLOCK_SIZE
+                for (j in 0 until BLOCK_SIZE) {
+                    val k = blockStart + j
+                    val qByte = qBuf.get(k / 2).toInt() and 0xFF
+                    val q = if (k % 2 == 0) (qByte and 0x0F) else ((qByte ushr 4) and 0x0F)
+                    row[k] = (q - zp).toFloat() * scale
+                }
             }
         }
+
+        if (fp32RowCache.size < MAX_HOT_CACHE_TOKENS) {
+            fp32RowCache.putIfAbsent(safeId, row)
+        }
+        return row
+    }
+
+    private fun getOrDecodeHalfRow(
+        tokId: Int,
+        fallbackQuantBuf: ByteBuffer?,
+        fallbackScalesBuf: ByteBuffer?,
+        fallbackZpBuf: ByteBuffer?
+    ): ShortArray {
+        val safeId = tokId.coerceIn(0, VOCAB_SIZE - 1)
+        fp16RowCache[safeId]?.let { return it }
+
+        val floatRow = getOrDecodeFloatRow(safeId, fallbackQuantBuf, fallbackScalesBuf, fallbackZpBuf)
+        val halfRow = ShortArray(HIDDEN_SIZE)
+        for (i in 0 until HIDDEN_SIZE) {
+            halfRow[i] = floatToHalfStatic(floatRow[i])
+        }
+        if (fp16RowCache.size < MAX_HOT_CACHE_TOKENS) {
+            fp16RowCache.putIfAbsent(safeId, halfRow)
+        }
+        return halfRow
+    }
+
+    /**
+     * Pre-warms all unique token IDs in the prompt across the dedicated GPU rolling-window workers
+     * so every subsequent prefill chunk gather hits the lock-free L1 RAM cache with zero I/O wait.
+     */
+    suspend fun prewarmPromptTokensParallel(promptIds: LongArray, expectsFp16: Boolean) = coroutineScope {
+        val uniqueIds = LinkedHashSet<Int>(promptIds.size)
+        for (id in promptIds) {
+            val safeId = id.toInt().coerceIn(0, VOCAB_SIZE - 1)
+            val alreadyCached = if (expectsFp16) fp16RowCache.containsKey(safeId) else fp32RowCache.containsKey(safeId)
+            if (!alreadyCached) {
+                uniqueIds.add(safeId)
+            }
+        }
+        if (uniqueIds.isEmpty()) return@coroutineScope
+
+        val uniqueList = uniqueIds.toIntArray()
+        val numWorkers = minOf(4, uniqueList.size)
+        val sliceSize = (uniqueList.size + numWorkers - 1) / numWorkers
+        val jobs = ArrayList<Deferred<Unit>>(numWorkers)
+
+        for (w in 0 until numWorkers) {
+            val startIdx = w * sliceSize
+            val endIdx = minOf(startIdx + sliceSize, uniqueList.size)
+            if (startIdx >= endIdx) continue
+            jobs.add(
+                async(rollingWindowDispatcher) {
+                    val qBuf = if (quantMapped == null) ByteBuffer.allocateDirect(QUANT_ROW_BYTES) else null
+                    val sBuf = if (scalesMapped == null) ByteBuffer.allocateDirect(SCALES_ROW_BYTES) else null
+                    val zBuf = if (zpMapped == null) ByteBuffer.allocateDirect(ZP_ROW_BYTES) else null
+                    for (i in startIdx until endIdx) {
+                        val tokId = uniqueList[i]
+                        if (expectsFp16) {
+                            getOrDecodeHalfRow(tokId, qBuf, sBuf, zBuf)
+                        } else {
+                            getOrDecodeFloatRow(tokId, qBuf, sBuf, zBuf)
+                        }
+                    }
+                }
+            )
+        }
+        jobs.awaitAll()
     }
 
     fun lookupEmbeddingsFloat32(tokenIds: LongArray): FloatBuffer {
@@ -155,19 +285,14 @@ class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
             .order(ByteOrder.nativeOrder())
             .asFloatBuffer()
 
-        val quantBuf = ByteBuffer.allocateDirect(QUANT_ROW_BYTES)
-        val scalesBuf = ByteBuffer.allocateDirect(SCALES_ROW_BYTES)
-        val zpBuf = ByteBuffer.allocateDirect(ZP_ROW_BYTES)
+        val qBuf = if (quantMapped == null) ByteBuffer.allocateDirect(QUANT_ROW_BYTES) else null
+        val sBuf = if (scalesMapped == null) ByteBuffer.allocateDirect(SCALES_ROW_BYTES) else null
+        val zBuf = if (zpMapped == null) ByteBuffer.allocateDirect(ZP_ROW_BYTES) else null
 
         for (s in 0 until seqLen) {
-            decodeSingleTokenRowIntoFloat(
-                tokId = tokenIds[s].toInt(),
-                outBuf = outBuf,
-                rowBase = s * HIDDEN_SIZE,
-                quantBuf = quantBuf,
-                scalesBuf = scalesBuf,
-                zpBuf = zpBuf
-            )
+            val row = getOrDecodeFloatRow(tokenIds[s].toInt(), qBuf, sBuf, zBuf)
+            outBuf.position(s * HIDDEN_SIZE)
+            outBuf.put(row, 0, HIDDEN_SIZE)
         }
         outBuf.position(0)
         return outBuf
@@ -175,7 +300,7 @@ class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
 
     suspend fun lookupEmbeddingsFloat32BatchParallel(tokenIds: LongArray): FloatBuffer = coroutineScope {
         val seqLen = tokenIds.size
-        if (seqLen <= 4) {
+        if (seqLen <= 8) {
             return@coroutineScope lookupEmbeddingsFloat32(tokenIds)
         }
         val outBuf = ByteBuffer.allocateDirect(seqLen * HIDDEN_SIZE * 4)
@@ -184,6 +309,7 @@ class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
 
         val numWorkers = minOf(4, seqLen)
         val sliceSize = (seqLen + numWorkers - 1) / numWorkers
+        val rows = arrayOfNulls<FloatArray>(seqLen)
         val jobs = ArrayList<Deferred<Unit>>(numWorkers)
 
         for (w in 0 until numWorkers) {
@@ -191,55 +317,85 @@ class DirectQ4F16EmbeddingTable(dataFile: File) : Closeable {
             val endIdx = minOf(startIdx + sliceSize, seqLen)
             if (startIdx >= endIdx) continue
             jobs.add(
-                async(Dispatchers.Default) {
-                    val quantBuf = ByteBuffer.allocateDirect(QUANT_ROW_BYTES)
-                    val scalesBuf = ByteBuffer.allocateDirect(SCALES_ROW_BYTES)
-                    val zpBuf = ByteBuffer.allocateDirect(ZP_ROW_BYTES)
+                async(rollingWindowDispatcher) {
+                    val qBuf = if (quantMapped == null) ByteBuffer.allocateDirect(QUANT_ROW_BYTES) else null
+                    val sBuf = if (scalesMapped == null) ByteBuffer.allocateDirect(SCALES_ROW_BYTES) else null
+                    val zBuf = if (zpMapped == null) ByteBuffer.allocateDirect(ZP_ROW_BYTES) else null
                     for (s in startIdx until endIdx) {
-                        decodeSingleTokenRowIntoFloat(
-                            tokId = tokenIds[s].toInt(),
-                            outBuf = outBuf,
-                            rowBase = s * HIDDEN_SIZE,
-                            quantBuf = quantBuf,
-                            scalesBuf = scalesBuf,
-                            zpBuf = zpBuf
-                        )
+                        rows[s] = getOrDecodeFloatRow(tokenIds[s].toInt(), qBuf, sBuf, zBuf)
                     }
                 }
             )
         }
         jobs.awaitAll()
+        for (s in 0 until seqLen) {
+            val r = rows[s] ?: continue
+            outBuf.put(r, 0, HIDDEN_SIZE)
+        }
         outBuf.position(0)
         outBuf
     }
 
     fun lookupEmbeddingsFloat16(tokenIds: LongArray): ShortBuffer {
-        val floatBuf = lookupEmbeddingsFloat32(tokenIds)
-        val total = tokenIds.size * HIDDEN_SIZE
-        val shortBuf = ByteBuffer.allocateDirect(total * 2)
+        val seqLen = tokenIds.size
+        val shortBuf = ByteBuffer.allocateDirect(seqLen * HIDDEN_SIZE * 2)
             .order(ByteOrder.nativeOrder())
             .asShortBuffer()
-        for (i in 0 until total) {
-            shortBuf.put(i, floatToHalfStatic(floatBuf.get(i)))
+
+        val qBuf = if (quantMapped == null) ByteBuffer.allocateDirect(QUANT_ROW_BYTES) else null
+        val sBuf = if (scalesMapped == null) ByteBuffer.allocateDirect(SCALES_ROW_BYTES) else null
+        val zBuf = if (zpMapped == null) ByteBuffer.allocateDirect(ZP_ROW_BYTES) else null
+
+        for (s in 0 until seqLen) {
+            val halfRow = getOrDecodeHalfRow(tokenIds[s].toInt(), qBuf, sBuf, zBuf)
+            shortBuf.position(s * HIDDEN_SIZE)
+            shortBuf.put(halfRow, 0, HIDDEN_SIZE)
         }
         shortBuf.position(0)
         return shortBuf
     }
 
-    suspend fun lookupEmbeddingsFloat16BatchParallel(tokenIds: LongArray): ShortBuffer {
-        val floatBuf = lookupEmbeddingsFloat32BatchParallel(tokenIds)
-        val total = tokenIds.size * HIDDEN_SIZE
-        val shortBuf = ByteBuffer.allocateDirect(total * 2)
+    suspend fun lookupEmbeddingsFloat16BatchParallel(tokenIds: LongArray): ShortBuffer = coroutineScope {
+        val seqLen = tokenIds.size
+        if (seqLen <= 8) {
+            return@coroutineScope lookupEmbeddingsFloat16(tokenIds)
+        }
+        val shortBuf = ByteBuffer.allocateDirect(seqLen * HIDDEN_SIZE * 2)
             .order(ByteOrder.nativeOrder())
             .asShortBuffer()
-        for (i in 0 until total) {
-            shortBuf.put(i, floatToHalfStatic(floatBuf.get(i)))
+
+        val numWorkers = minOf(4, seqLen)
+        val sliceSize = (seqLen + numWorkers - 1) / numWorkers
+        val rows = arrayOfNulls<ShortArray>(seqLen)
+        val jobs = ArrayList<Deferred<Unit>>(numWorkers)
+
+        for (w in 0 until numWorkers) {
+            val startIdx = w * sliceSize
+            val endIdx = minOf(startIdx + sliceSize, seqLen)
+            if (startIdx >= endIdx) continue
+            jobs.add(
+                async(rollingWindowDispatcher) {
+                    val qBuf = if (quantMapped == null) ByteBuffer.allocateDirect(QUANT_ROW_BYTES) else null
+                    val sBuf = if (scalesMapped == null) ByteBuffer.allocateDirect(SCALES_ROW_BYTES) else null
+                    val zBuf = if (zpMapped == null) ByteBuffer.allocateDirect(ZP_ROW_BYTES) else null
+                    for (s in startIdx until endIdx) {
+                        rows[s] = getOrDecodeHalfRow(tokenIds[s].toInt(), qBuf, sBuf, zBuf)
+                    }
+                }
+            )
+        }
+        jobs.awaitAll()
+        for (s in 0 until seqLen) {
+            val r = rows[s] ?: continue
+            shortBuf.put(r, 0, HIDDEN_SIZE)
         }
         shortBuf.position(0)
-        return shortBuf
+        shortBuf
     }
 
     override fun close() {
+        fp32RowCache.clear()
+        fp16RowCache.clear()
         runCatching { channel.close() }
         runCatching { raf.close() }
     }
@@ -636,10 +792,24 @@ class QwenOnnxNpuEngine {
         private const val TAG = "QwenOnnxNpuEngine"
         /**
          * Chunk prefill into 32-token slices so the 248,320-vocab logits tensor never exceeds
-         * `32 * 248,320 * 2 = 15.8 MB` of native memory per step, and the GPU batch embedder
-         * can prefetch Chunk k+1 while the NPU executes Chunk k.
+         * `32 * 248,320 * 2 = 15.8 MB` of native memory per step, and the GPU rolling-window
+         * ring buffer continuously stages up to 6 chunks ahead of the NPU.
          */
         private const val PREFILL_CHUNK_SIZE = 32
+        private const val ROLLING_WINDOW_PREFETCH_DEPTH = 6
+
+        private val gpuRollingThreadCounter = AtomicInteger(0)
+        /**
+         * Dedicated 4-thread high-priority GPU / Embedding Rolling-Window compute pool isolated from
+         * `Dispatchers.Default` and ONNX Runtime's intra-op threads so the NPU never stalls waiting
+         * for thread scheduling or embedding tensor preparation.
+         */
+        val gpuRollingWindowDispatcher: CoroutineDispatcher = Executors.newFixedThreadPool(4) { runnable ->
+            Thread(runnable, "CopyFlow-GPU-RollingWindow-${gpuRollingThreadCounter.getAndIncrement()}").apply {
+                isDaemon = true
+                priority = (Thread.NORM_PRIORITY + 2).coerceAtMost(Thread.MAX_PRIORITY)
+            }
+        }.asCoroutineDispatcher()
     }
 
     private var ortEnv: OrtEnvironment? = null
@@ -651,6 +821,7 @@ class QwenOnnxNpuEngine {
     private var loadedModelDir: String? = null
     private var loadedProvider: ExecutionProviderMode? = null
     private var sessionMetadata: SessionGraphMetadata? = null
+    private var cachedOutputToPastMappings: List<Pair<Int, String>> = emptyList()
 
     suspend fun initializeIfNeeded(
         readyState: ModelState.Ready
@@ -685,7 +856,11 @@ class QwenOnnxNpuEngine {
 
         val bpeTokenizer = QwenBpeTokenizer(tokenizerFile)
         tokenizer = bpeTokenizer
-        directEmbedTable = if (embedDataFile.exists()) DirectQ4F16EmbeddingTable(embedDataFile) else null
+        directEmbedTable = if (embedDataFile.exists()) {
+            DirectQ4F16EmbeddingTable(embedDataFile, gpuRollingWindowDispatcher)
+        } else {
+            null
+        }
 
         val socProfile = SocHardwareDetector.detect()
         val effectiveMode = if (readyState.executionProvider == ExecutionProviderMode.AUTO_NPU_GPU) {
@@ -779,12 +954,12 @@ class QwenOnnxNpuEngine {
             activeProviders.add("CPU_ARM64")
         }
 
-        // Dedicated GPU Execution Provider Options for the Batch Tokenizer / Embedding stage
-        // so the GPU handles batch token embeddings while the NPU runs `decoder_model_merged_q4f16.onnx`.
+        // Dedicated GPU Rolling-Window Execution Provider Options for the Batch Tokenizer / Embedding stage
+        // so the GPU / Rolling-Window compute pool stages embeddings ahead of `decoder_model_merged_q4f16.onnx`.
         val gpuEmbedProviders = mutableListOf<String>()
         val embedSess = if (directEmbedTable != null) {
             gpuEmbedProviders.add("GPU_BatchTokenizer(${socProfile.vendor.gpuName})")
-            gpuEmbedProviders.add("Async_DirectQ4F16_BatchChannel(4W)")
+            gpuEmbedProviders.add("RollingWindow_MappedQ4F16(6x32_RingBuffer)")
             null
         } else {
             val gpuOptions = OrtSession.SessionOptions().apply {
@@ -807,6 +982,23 @@ class QwenOnnxNpuEngine {
             if (vf.exists()) runCatching { env.createSession(vf.absolutePath, decoderOptions) }.getOrNull() else null
         }
 
+        // Precompute outputIdx -> pastInputName mapping once so `runSingleStep` has zero string allocation overhead
+        val outNamesList = decoderSess.outputNames.toList()
+        val mappings = ArrayList<Pair<Int, String>>(outNamesList.size)
+        for (outIdx in 1 until outNamesList.size) {
+            val outName = outNamesList[outIdx]
+            val pastName = when {
+                outName.startsWith("present.") -> outName.replaceFirst("present.", "past_key_values.")
+                outName.startsWith("present_conv.") -> outName.replaceFirst("present_conv.", "past_conv.")
+                outName.startsWith("present_recurrent.") -> outName.replaceFirst("present_recurrent.", "past_recurrent.")
+                else -> null
+            }
+            if (pastName != null && decoderSess.inputNames.contains(pastName)) {
+                mappings.add(outIdx to pastName)
+            }
+        }
+        cachedOutputToPastMappings = mappings
+
         embedSession = embedSess
         decoderSession = decoderSess
         visionSession = visSess
@@ -821,7 +1013,7 @@ class QwenOnnxNpuEngine {
         val embedOutMap = embedSess?.outputInfo?.mapValues { (_, v) ->
             val ti = v.info as? TensorInfo
             "${ti?.type}:${ti?.shape?.contentToString()}"
-        } ?: mapOf("inputs_embeds" to "FLOAT:[batch_size, sequence_length, 1024] (Async GPU-Pipelined Batch Q4F16)")
+        } ?: mapOf("inputs_embeds" to "FLOAT:[batch_size, sequence_length, 1024] (Rolling-Window 6-Chunk GPU RingBuffer)")
 
         val decoderInMap = decoderSess.inputInfo.mapValues { (_, v) ->
             val ti = v.info as? TensorInfo
@@ -911,9 +1103,10 @@ class QwenOnnxNpuEngine {
 
     /**
      * Streams generation using:
-     * 1. Parallel Batch BPE Tokenization (`tok.encodeBatchParallel`)
-     * 2. Double-Buffered Async GPU-Batch-Embedding -> NPU-Decoder Pipelining during 32-token prefill
-     * 3. O(1) incremental token decoding + live `<think>...</think>` separation & duration tracking
+     * 1. Parallel Batch BPE Tokenization (`tok.encodeBatchParallel`) + Hot-Vocabulary Prompt Pre-Warming
+     * 2. Multi-Slot Rolling Window GPU-Batch-Embedding -> NPU-Decoder Ring Buffer (`Channel(capacity = 6)`)
+     *    on a dedicated 4-thread GPU/Embedding pool so the NPU never stalls waiting on the GPU
+     * 3. Overlapped Stage 3 Autoregressive Decode Embedding Prefetch + Parallel KV/Recurrent State Handoff
      * 4. Early anti-summarization-loop breaker when `breakOnProseWhenToolExpected` is enabled
      */
     fun streamGeneration(
@@ -933,10 +1126,19 @@ class QwenOnnxNpuEngine {
             val decoderSess = decoderSession ?: throw IllegalStateException("decoder_model_merged session not initialized")
             val tok = tokenizer ?: throw IllegalStateException("QwenBpeTokenizer not initialized")
 
-            // Stage 1: Parallel Batch Tokenization (with BPE Word Cache)
+            val expectsEmbeds = decoderSess.inputNames.contains("inputs_embeds")
+            val expectsFp16Embeds = (decoderSess.inputInfo["inputs_embeds"]?.info as? TensorInfo)?.type == OnnxJavaType.FLOAT16
+
+            // Stage 1: Parallel Batch Tokenization + Parallel Hot-Vocabulary Embedding Pre-Warming
             telemetryMonitor?.onStageChanged(HardwareExecutionStage.GPU_BATCH_TOKENIZE)
             val tokStartNs = System.nanoTime()
-            val promptIds = tok.encodeBatchParallel(promptText)
+            val promptIds = withContext(gpuRollingWindowDispatcher) {
+                val ids = tok.encodeBatchParallel(promptText)
+                if (expectsEmbeds) {
+                    directEmbedTable?.prewarmPromptTokensParallel(ids, expectsFp16Embeds)
+                }
+                ids
+            }
             val tokDurationNs = System.nanoTime() - tokStartNs
             telemetryMonitor?.recordBatchTokenization(tokDurationNs, promptIds.size)
             if (promptIds.isEmpty()) {
@@ -961,75 +1163,82 @@ class QwenOnnxNpuEngine {
                     cursor = end
                 }
 
-                val expectsEmbeds = decoderSess.inputNames.contains("inputs_embeds")
-                val expectsFp16Embeds = (decoderSess.inputInfo["inputs_embeds"]?.info as? TensorInfo)?.type == OnnxJavaType.FLOAT16
-
-                // Stage 2: Double-Buffered Producer-Consumer Prefill
-                // While the NPU executes `decoderSession.run()` on Chunk k, the GPU / Batch Embed pipeline
-                // concurrently prepares the `[1, chunkLen, 1024]` embedding tensor for Chunk k+1!
+                // Stage 2: True Multi-Slot Rolling Window GPU -> NPU Ring Buffer Prefill
+                // A dedicated producer coroutine on `gpuRollingWindowDispatcher` continuously fills a 6-slot
+                // ring buffer (`rollingEmbedChannel`) with ready-to-run `[1, chunkLen, 1024]` OnnxTensors
+                // while the NPU consumes them back-to-back with zero idle stall!
                 var firstGeneratedTokenId = 0L
                 coroutineScope {
-                    var prefetchedEmbedJob: Deferred<OnnxTensor?>? = if (expectsEmbeds && chunks.isNotEmpty()) {
-                        async(Dispatchers.Default) {
-                            val pfStart = System.nanoTime()
-                            val t = createBatchEmbedTensor(env, embedSession, directEmbedTable, chunks[0], expectsFp16Embeds)
-                            telemetryMonitor?.recordGpuEmbedPrefetch(System.nanoTime() - pfStart)
-                            t
+                    val rollingEmbedChannel = Channel<OnnxTensor?>(capacity = ROLLING_WINDOW_PREFETCH_DEPTH)
+                    val producerJob = launch(gpuRollingWindowDispatcher) {
+                        try {
+                            for (cIdx in chunks.indices) {
+                                ensureActive()
+                                if (expectsEmbeds) {
+                                    val pfStart = System.nanoTime()
+                                    val tensor = createBatchEmbedTensor(
+                                        env = env,
+                                        embedSess = embedSession,
+                                        directEmbed = directEmbedTable,
+                                        chunkIds = chunks[cIdx],
+                                        expectsFp16 = expectsFp16Embeds
+                                    )
+                                    telemetryMonitor?.recordGpuEmbedPrefetch(System.nanoTime() - pfStart)
+                                    rollingEmbedChannel.send(tensor)
+                                } else {
+                                    rollingEmbedChannel.send(null)
+                                }
+                            }
+                        } finally {
+                            rollingEmbedChannel.close()
                         }
-                    } else {
-                        null
                     }
 
-                    for (chunkIdx in chunks.indices) {
-                        currentCoroutineContext().ensureActive()
-                        val chunkIds = chunks[chunkIdx]
-                        val isLastPrefillChunk = (chunkIdx == chunks.lastIndex)
+                    try {
+                        for (chunkIdx in chunks.indices) {
+                            currentCoroutineContext().ensureActive()
+                            val chunkIds = chunks[chunkIdx]
+                            val isLastPrefillChunk = (chunkIdx == chunks.lastIndex)
 
-                        val currentEmbedTensor = prefetchedEmbedJob?.await()
+                            // Pull the next pre-staged embedding tensor from the rolling window ring buffer
+                            val currentEmbedTensor = rollingEmbedChannel.receive()
 
-                        // Immediately launch GPU / parallel batch embedding prefetch for Chunk (chunkIdx + 1)
-                        // while the NPU runs Chunk (chunkIdx)
-                        prefetchedEmbedJob = if (expectsEmbeds && chunkIdx + 1 < chunks.size) {
-                            val nextChunkIds = chunks[chunkIdx + 1]
-                            async(Dispatchers.Default) {
-                                val pfStart = System.nanoTime()
-                                val t = createBatchEmbedTensor(env, embedSession, directEmbedTable, nextChunkIds, expectsFp16Embeds)
-                                telemetryMonitor?.recordGpuEmbedPrefetch(System.nanoTime() - pfStart)
-                                t
+                            val npuStepStartNs = System.nanoTime()
+                            val sampled = runSingleStep(
+                                env = env,
+                                embedSess = embedSession,
+                                directEmbed = directEmbedTable,
+                                precomputedEmbedTensor = currentEmbedTensor,
+                                decoderSess = decoderSess,
+                                meta = meta,
+                                stepInputIds = chunkIds,
+                                pastSeqLen = totalPastLen,
+                                stateTensors = stateTensors,
+                                computeArgMax = isLastPrefillChunk
+                            )
+                            val npuStepDurNs = System.nanoTime() - npuStepStartNs
+                            telemetryMonitor?.recordNpuDecoderStep(
+                                durationNs = npuStepDurNs,
+                                chunkSeqLen = chunkIds.size,
+                                isPrefill = true,
+                                totalGeneratedTokens = if (isLastPrefillChunk) 1 else 0,
+                                decodeTokPerSec = 0f
+                            )
+                            totalPastLen += chunkIds.size
+                            if (isLastPrefillChunk) {
+                                firstGeneratedTokenId = sampled
                             }
-                        } else {
-                            null
                         }
-
-                        val npuStepStartNs = System.nanoTime()
-                        val sampled = runSingleStep(
-                            env = env,
-                            embedSess = embedSession,
-                            directEmbed = directEmbedTable,
-                            precomputedEmbedTensor = currentEmbedTensor,
-                            decoderSess = decoderSess,
-                            meta = meta,
-                            stepInputIds = chunkIds,
-                            pastSeqLen = totalPastLen,
-                            stateTensors = stateTensors,
-                            computeArgMax = isLastPrefillChunk
-                        )
-                        val npuStepDurNs = System.nanoTime() - npuStepStartNs
-                        telemetryMonitor?.recordNpuDecoderStep(
-                            durationNs = npuStepDurNs,
-                            chunkSeqLen = chunkIds.size,
-                            isPrefill = true,
-                            totalGeneratedTokens = if (isLastPrefillChunk) 1 else 0,
-                            decodeTokPerSec = 0f
-                        )
-                        totalPastLen += chunkIds.size
-                        if (isLastPrefillChunk) {
-                            firstGeneratedTokenId = sampled
+                    } finally {
+                        producerJob.cancel()
+                        while (true) {
+                            val leftover = rollingEmbedChannel.tryReceive().getOrNull() ?: break
+                            runCatching { leftover.close() }
                         }
                     }
                 }
 
-                // Stage 3: Autoregressive Token Generation with O(1) Incremental Decoding & Live Thought Split
+                // Stage 3: Autoregressive Token Generation with Overlapped GPU Decode Embedding Prefetch
                 val accumulatedTextBuilder = StringBuilder(initialAssistantPrefix)
                 var nextTokenId = firstGeneratedTokenId
                 var step = 0
@@ -1043,107 +1252,136 @@ class QwenOnnxNpuEngine {
                     thoughtEndNs = System.nanoTime()
                 }
 
-                while (step < effectiveLimit) {
-                    currentCoroutineContext().ensureActive()
+                var earlyDetectedTool: ParsedToolCall? = null
+                coroutineScope {
+                    var nextDecodeEmbedJob: Deferred<OnnxTensor?>? = null
+                    try {
+                        while (step < effectiveLimit) {
+                            currentCoroutineContext().ensureActive()
 
-                    if (step > 0) {
-                        val decodeStepStartNs = System.nanoTime()
-                        nextTokenId = runSingleStep(
-                            env = env,
-                            embedSess = embedSession,
-                            directEmbed = directEmbedTable,
-                            precomputedEmbedTensor = null,
-                            decoderSess = decoderSess,
-                            meta = meta,
-                            stepInputIds = longArrayOf(nextTokenId),
-                            pastSeqLen = totalPastLen,
-                            stateTensors = stateTensors,
-                            computeArgMax = true
-                        )
-                        val decodeStepDurNs = System.nanoTime() - decodeStepStartNs
-                        totalPastLen += 1
-                        val elapsedSecNow = ((System.nanoTime() - startTimeNs) / 1_000_000_000.0f).coerceAtLeast(0.001f)
-                        val tpsNow = (generatedIds.size + 1) / elapsedSecNow
-                        telemetryMonitor?.recordNpuDecoderStep(
-                            durationNs = decodeStepDurNs,
-                            chunkSeqLen = 1,
-                            isPrefill = false,
-                            totalGeneratedTokens = generatedIds.size + 1,
-                            decodeTokPerSec = tpsNow
-                        )
-                    }
+                            if (step > 0) {
+                                val preStagedDecodeEmbed = nextDecodeEmbedJob?.await()
+                                nextDecodeEmbedJob = null
 
-                    generatedIds.add(nextTokenId)
+                                val decodeStepStartNs = System.nanoTime()
+                                nextTokenId = runSingleStep(
+                                    env = env,
+                                    embedSess = embedSession,
+                                    directEmbed = directEmbedTable,
+                                    precomputedEmbedTensor = preStagedDecodeEmbed,
+                                    decoderSess = decoderSess,
+                                    meta = meta,
+                                    stepInputIds = longArrayOf(nextTokenId),
+                                    pastSeqLen = totalPastLen,
+                                    stateTensors = stateTensors,
+                                    computeArgMax = true
+                                )
+                                val decodeStepDurNs = System.nanoTime() - decodeStepStartNs
+                                totalPastLen += 1
+                                val elapsedSecNow = ((System.nanoTime() - startTimeNs) / 1_000_000_000.0f).coerceAtLeast(0.001f)
+                                val tpsNow = (generatedIds.size + 1) / elapsedSecNow
+                                telemetryMonitor?.recordNpuDecoderStep(
+                                    durationNs = decodeStepDurNs,
+                                    chunkSeqLen = 1,
+                                    isPrefill = false,
+                                    totalGeneratedTokens = generatedIds.size + 1,
+                                    decodeTokPerSec = tpsNow
+                                )
+                            }
 
-                    if (nextTokenId.toInt() == tok.imEndId || nextTokenId.toInt() == tok.eosTokenId) {
-                        break
-                    }
+                            generatedIds.add(nextTokenId)
 
-                    val deltaDecoded = tok.decodeSingleToken(nextTokenId, skipSpecialTokens = true)
-                    accumulatedTextBuilder.append(deltaDecoded)
-                    val fullDecoded = accumulatedTextBuilder.toString()
+                            if (nextTokenId.toInt() == tok.imEndId || nextTokenId.toInt() == tok.eosTokenId) {
+                                break
+                            }
 
-                    val split = ThoughtChainParser.splitThoughtAndContent(fullDecoded)
-                    if (!split.isCurrentlyThinking && thoughtEndNs == 0L && split.thoughtText.isNotEmpty()) {
-                        thoughtEndNs = System.nanoTime()
-                    }
-                    val currentThoughtMs = if (split.thoughtText.isNotEmpty() || split.isCurrentlyThinking) {
-                        val endRef = if (thoughtEndNs > 0L) thoughtEndNs else System.nanoTime()
-                        ((endRef - thoughtStartNs) / 1_000_000L).coerceAtLeast(50L)
-                    } else {
-                        0L
-                    }
+                            // Immediately launch GPU rolling-window embedding preparation for `nextTokenId`
+                            // WHILE we decode the string, parse `<think>`, and emit the UI state!
+                            if (expectsEmbeds && step + 1 < effectiveLimit) {
+                                val tokenForNextStep = nextTokenId
+                                nextDecodeEmbedJob = async(gpuRollingWindowDispatcher) {
+                                    createBatchEmbedTensor(
+                                        env = env,
+                                        embedSess = embedSession,
+                                        directEmbed = directEmbedTable,
+                                        chunkIds = longArrayOf(tokenForNextStep),
+                                        expectsFp16 = expectsFp16Embeds
+                                    )
+                                }
+                            }
 
-                    val elapsedSec = ((System.nanoTime() - startTimeNs) / 1_000_000_000.0f).coerceAtLeast(0.001f)
-                    val tps = generatedIds.size / elapsedSec
+                            val deltaDecoded = tok.decodeSingleToken(nextTokenId, skipSpecialTokens = true)
+                            accumulatedTextBuilder.append(deltaDecoded)
+                            val fullDecoded = accumulatedTextBuilder.toString()
 
-                    emit(
-                        GenerationEvent.TokenDelta(
-                            textDelta = deltaDecoded,
-                            fullTextSoFar = fullDecoded,
-                            visibleTextSoFar = split.visibleContent,
-                            thoughtTextSoFar = split.thoughtText,
-                            thoughtSummaryLine = split.summaryLine,
-                            isThinkingPhase = split.isCurrentlyThinking,
-                            thoughtDurationMs = currentThoughtMs,
-                            tokensGenerated = generatedIds.size,
-                            tokensPerSec = tps
-                        )
-                    )
+                            val split = ThoughtChainParser.splitThoughtAndContent(fullDecoded)
+                            if (!split.isCurrentlyThinking && thoughtEndNs == 0L && split.thoughtText.isNotEmpty()) {
+                                thoughtEndNs = System.nanoTime()
+                            }
+                            val currentThoughtMs = if (split.thoughtText.isNotEmpty() || split.isCurrentlyThinking) {
+                                val endRef = if (thoughtEndNs > 0L) thoughtEndNs else System.nanoTime()
+                                ((endRef - thoughtStartNs) / 1_000_000L).coerceAtLeast(50L)
+                            } else {
+                                0L
+                            }
 
-                    val parsedTool = extractToolCallIfComplete(
-                        text = fullDecoded,
-                        allowUnclosedAtEos = false,
-                        thoughtText = split.thoughtText,
-                        thoughtDurationMs = currentThoughtMs
-                    )
-                    if (parsedTool != null) {
-                        emit(GenerationEvent.ToolCallDetected(parsedTool))
-                        return@flow
-                    }
+                            val elapsedSec = ((System.nanoTime() - startTimeNs) / 1_000_000_000.0f).coerceAtLeast(0.001f)
+                            val tps = generatedIds.size / elapsedSec
 
-                    // Anti-Summarization-Loop Early Breaker:
-                    // When a tool call is strictly expected (e.g., right after `inspect_template` when `READY_TO_CLONE`),
-                    // if the model exits `<think>` and starts generating > 24 tokens of plain-text prose without `<tool_call>`,
-                    // break early so the agentic loop immediately chains `clone_document` without wasting time on verbose prose!
-                    if (breakOnProseWhenToolExpected && !split.isCurrentlyThinking && !fullDecoded.contains("<tool_call>")) {
-                        nonThoughtProseTokens++
-                        if (nonThoughtProseTokens >= 24) {
-                            Log.i(TAG, "Anti-summarization-loop breaker triggered after $nonThoughtProseTokens prose tokens.")
-                            break
+                            emit(
+                                GenerationEvent.TokenDelta(
+                                    textDelta = deltaDecoded,
+                                    fullTextSoFar = fullDecoded,
+                                    visibleTextSoFar = split.visibleContent,
+                                    thoughtTextSoFar = split.thoughtText,
+                                    thoughtSummaryLine = split.summaryLine,
+                                    isThinkingPhase = split.isCurrentlyThinking,
+                                    thoughtDurationMs = currentThoughtMs,
+                                    tokensGenerated = generatedIds.size,
+                                    tokensPerSec = tps
+                                )
+                            )
+
+                            val parsedTool = extractToolCallIfComplete(
+                                text = fullDecoded,
+                                allowUnclosedAtEos = false,
+                                thoughtText = split.thoughtText,
+                                thoughtDurationMs = currentThoughtMs
+                            )
+                            if (parsedTool != null) {
+                                earlyDetectedTool = parsedTool
+                                break
+                            }
+
+                            // Anti-Summarization-Loop Early Breaker:
+                            if (breakOnProseWhenToolExpected && !split.isCurrentlyThinking && !fullDecoded.contains("<tool_call>")) {
+                                nonThoughtProseTokens++
+                                if (nonThoughtProseTokens >= 24) {
+                                    Log.i(TAG, "Anti-summarization-loop breaker triggered after $nonThoughtProseTokens prose tokens.")
+                                    break
+                                }
+                            }
+
+                            // If we are about to hit maxNewTokens while inside an unclosed <tool_call> tag,
+                            // extend the limit by 160 tokens on the existing KV-cache so the JSON completes cleanly.
+                            if (!grantedToolGraceTokens && step >= effectiveLimit - 4 &&
+                                fullDecoded.contains("<tool_call>") && !fullDecoded.contains("</tool_call>")
+                            ) {
+                                effectiveLimit += 160
+                                grantedToolGraceTokens = true
+                            }
+
+                            step++
                         }
+                    } finally {
+                        nextDecodeEmbedJob?.cancel()
+                        runCatching { nextDecodeEmbedJob?.getCompleted()?.close() }
                     }
+                }
 
-                    // If we are about to hit maxNewTokens while inside an unclosed <tool_call> tag,
-                    // extend the limit by 160 tokens on the existing KV-cache so the JSON completes cleanly.
-                    if (!grantedToolGraceTokens && step >= effectiveLimit - 4 &&
-                        fullDecoded.contains("<tool_call>") && !fullDecoded.contains("</tool_call>")
-                    ) {
-                        effectiveLimit += 160
-                        grantedToolGraceTokens = true
-                    }
-
-                    step++
+                if (earlyDetectedTool != null) {
+                    emit(GenerationEvent.ToolCallDetected(earlyDetectedTool!!))
+                    return@flow
                 }
 
                 val finalDecoded = accumulatedTextBuilder.toString()
@@ -1320,7 +1558,7 @@ class QwenOnnxNpuEngine {
         val stepOwnedTensors = ArrayList<OnnxTensor>(8)
 
         try {
-            val decoderFeed = HashMap<String, OnnxTensor>()
+            val decoderFeed = HashMap<String, OnnxTensor>(stateTensors.size + 8)
 
             if (decoderSess.inputNames.contains("inputs_embeds")) {
                 if (precomputedEmbedTensor != null) {
@@ -1435,16 +1673,48 @@ class QwenOnnxNpuEngine {
                     0L
                 }
 
-                val outputNamesList = decoderSess.outputNames.toList()
-                for (outIdx in 1 until outputNamesList.size) {
-                    val outName = outputNamesList[outIdx]
-                    val pastName = when {
-                        outName.startsWith("present.") -> outName.replaceFirst("present.", "past_key_values.")
-                        outName.startsWith("present_conv.") -> outName.replaceFirst("present_conv.", "past_conv.")
-                        outName.startsWith("present_recurrent.") -> outName.replaceFirst("present_recurrent.", "past_recurrent.")
-                        else -> null
+                val mappings = cachedOutputToPastMappings
+                if (mappings.size >= 8) {
+                    // Parallelize direct ByteBuffer copies of the 36+ hybrid KV/Conv/Recurrent state tensors
+                    // across the dedicated GPU rolling-window workers so state handoff completes 3x faster
+                    val clonedPairs = runBlocking(gpuRollingWindowDispatcher) {
+                        val numWorkers = 4
+                        val sliceSize = (mappings.size + numWorkers - 1) / numWorkers
+                        val jobs = ArrayList<Deferred<List<Pair<String, OnnxTensor>>>>(numWorkers)
+                        for (w in 0 until numWorkers) {
+                            val startIdx = w * sliceSize
+                            val endIdx = minOf(startIdx + sliceSize, mappings.size)
+                            if (startIdx >= endIdx) continue
+                            jobs.add(
+                                async {
+                                    val localList = ArrayList<Pair<String, OnnxTensor>>(endIdx - startIdx)
+                                    for (i in startIdx until endIdx) {
+                                        val (outIdx, pastName) = mappings[i]
+                                        val presentTensor = decoderResult.get(outIdx) as OnnxTensor
+                                        val pInfo = presentTensor.info as TensorInfo
+                                        val pBytes = presentTensor.byteBuffer
+                                        val copiedBytes = ByteBuffer.allocateDirect(pBytes.remaining()).order(ByteOrder.nativeOrder())
+                                        copiedBytes.put(pBytes)
+                                        copiedBytes.flip()
+
+                                        val nextStateTensor = if (pInfo.type == OnnxJavaType.FLOAT16) {
+                                            OnnxTensor.createTensor(env, copiedBytes.asShortBuffer(), pInfo.shape, OnnxJavaType.FLOAT16)
+                                        } else {
+                                            OnnxTensor.createTensor(env, copiedBytes.asFloatBuffer(), pInfo.shape)
+                                        }
+                                        localList.add(pastName to nextStateTensor)
+                                    }
+                                    localList
+                                }
+                            )
+                        }
+                        jobs.awaitAll().flatten()
                     }
-                    if (pastName != null && decoderSess.inputNames.contains(pastName)) {
+                    for ((pastName, nextStateTensor) in clonedPairs) {
+                        stateTensors.put(pastName, nextStateTensor)?.close()
+                    }
+                } else {
+                    for ((outIdx, pastName) in mappings) {
                         val presentTensor = decoderResult.get(outIdx) as OnnxTensor
                         val pInfo = presentTensor.info as TensorInfo
                         val pBytes = presentTensor.byteBuffer

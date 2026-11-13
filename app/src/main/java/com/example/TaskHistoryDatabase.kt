@@ -48,7 +48,7 @@ data class ModelConfigEntity(
     val executionProvider: String = ExecutionProviderMode.AUTO_NPU_GPU.name,
     val includeVisionEncoder: Boolean = false,
     val maxNewTokens: Int = 512,
-    val autoSyncTelemetryGitHub: Boolean = false
+    val autoSyncTelemetryGitHub: Boolean = true
 )
 
 @Entity(tableName = "telemetry_runs")

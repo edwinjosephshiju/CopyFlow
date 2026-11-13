@@ -1014,7 +1014,7 @@ fun HexagonNpuTelemetryHudBar(
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Sync to GitHub", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Text("Sync to Firestore", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                     }
 
                     OutlinedButton(
@@ -1108,7 +1108,8 @@ fun CopyFlowSettingsModal(
     onCheckGitHubReleases: () -> Unit,
     onDownloadReleaseApk: (GitHubReleaseState.UpdateAvailable) -> Unit,
     onInstallReleaseApk: (String) -> Unit,
-    onClearChatHistory: () -> Unit
+    onClearChatHistory: () -> Unit,
+    onSignOut: () -> Unit = {}
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -1407,7 +1408,7 @@ fun CopyFlowSettingsModal(
                 }
             }
 
-            // Section 4: Hexagon v73 HTP Telemetry Flight Recorder & Option #2 GitHub Sync
+            // Section 4: Built-In AI Studio Cloud Firestore Telemetry Sink
             Surface(
                 shape = RoundedCornerShape(16.dp),
                 color = GeminiInputBarBg,
@@ -1429,7 +1430,7 @@ fun CopyFlowSettingsModal(
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
-                            text = "Hexagon v73 HTP Telemetry & GitHub Sync (Option #2)",
+                            text = "Built-In AI Studio Cloud Firestore Telemetry Sink",
                             style = MaterialTheme.typography.titleSmall.copy(
                                 color = GeminiTextWhite,
                                 fontWeight = FontWeight.SemiBold
@@ -1438,24 +1439,15 @@ fun CopyFlowSettingsModal(
                     }
 
                     Text(
-                        text = if (uiState.hasGitHubToken) {
-                            "GitHub PAT loaded via BuildConfig.GITHUB_TOKEN (AI Studio Secrets panel)."
-                        } else {
-                            "Configure GITHUB_TOKEN and GITHUB_REPO in the AI Studio Secrets panel (.env) for automated GitHub push, or export the JSON Flight Log below."
+                        text = buildString {
+                            append("Authenticated Google Account: ")
+                            append(uiState.signedInUserEmail ?: uiState.signedInUserId)
+                            append("\nCollection Path: /users/${uiState.signedInUserId}/telemetry_runs")
                         },
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            color = if (uiState.hasGitHubToken) ArgonEmerald else GeminiTextSecondary
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            color = ArgonEmerald
                         )
-                    )
-
-                    OutlinedTextField(
-                        value = uiState.githubRepoSlug,
-                        onValueChange = onUpdateGitHubRepoSlug,
-                        label = { Text("GitHub Repository (owner/repo)", color = GeminiTextSecondary) },
-                        singleLine = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("settings_github_repo_input")
                     )
 
                     Row(
@@ -1465,11 +1457,11 @@ fun CopyFlowSettingsModal(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Auto-Sync Telemetry to GitHub After Each Task",
+                                text = "Auto-Sync Telemetry to Cloud Firestore",
                                 style = MaterialTheme.typography.bodyMedium.copy(color = GeminiTextWhite)
                             )
                             Text(
-                                text = "Automatically uploads telemetry/copyflow_<device>_latest.json via GitHub API",
+                                text = "Automatically streams Hexagon v73 HTP NPU duty cycle, thermal state, and OpenXML clone timings to Cloud Firestore",
                                 style = MaterialTheme.typography.bodySmall.copy(color = GeminiTextSecondary)
                             )
                         }
@@ -1481,7 +1473,7 @@ fun CopyFlowSettingsModal(
 
                     Text(
                         text = "Status: ${uiState.telemetrySnapshot.githubSyncStatus}\n" +
-                            "Recorded Flight Runs in SQLite: ${uiState.telemetryRuns.size}",
+                            "Local SQLite Runs: ${uiState.telemetryRuns.size} • Cloud Firestore Runs: ${uiState.cloudTelemetryRuns.size}",
                         style = MaterialTheme.typography.labelSmall.copy(
                             fontFamily = JetBrainsMonoFontFamily,
                             color = ArgonCyan
@@ -1509,7 +1501,7 @@ fun CopyFlowSettingsModal(
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Sync GitHub", fontWeight = FontWeight.SemiBold)
+                            Text("Sync Firestore", fontWeight = FontWeight.SemiBold)
                         }
 
                         OutlinedButton(
@@ -1562,6 +1554,16 @@ fun CopyFlowSettingsModal(
                             )
                         )
                     }
+
+                    OutlinedTextField(
+                        value = uiState.githubRepoSlug,
+                        onValueChange = onUpdateGitHubRepoSlug,
+                        label = { Text("GitHub Releases Repo (owner/repo)", color = GeminiTextSecondary) },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_github_repo_input")
+                    )
 
                     Text(
                         text = "Installed Version: v${BuildConfig.VERSION_NAME} (Code ${BuildConfig.VERSION_CODE}) • Repo: ${uiState.githubRepoSlug}",
@@ -1716,23 +1718,39 @@ fun CopyFlowSettingsModal(
                 }
             }
 
-            // Section 6: Clear Chat History
-            OutlinedButton(
-                onClick = onClearChatHistory,
-                border = BorderStroke(1.dp, ArgonCoral.copy(alpha = 0.5f)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("clear_all_history_button")
+            // Section 6: Clear Chat History & Sign Out
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Outlined.DeleteOutline,
-                    contentDescription = null,
-                    tint = ArgonCoral,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Clear All Saved Chat History", color = ArgonCoral)
+                OutlinedButton(
+                    onClick = onClearChatHistory,
+                    border = BorderStroke(1.dp, ArgonCoral.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("clear_all_history_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.DeleteOutline,
+                        contentDescription = null,
+                        tint = ArgonCoral,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Clear History", color = ArgonCoral)
+                }
+
+                OutlinedButton(
+                    onClick = onSignOut,
+                    border = BorderStroke(1.dp, GeminiInputBarStroke),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("settings_sign_out_button")
+                ) {
+                    Text("Sign Out", color = GeminiTextWhite)
+                }
             }
 
             Spacer(modifier = Modifier.height(20.dp))
