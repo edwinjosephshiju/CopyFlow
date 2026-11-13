@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">CopyFlow</string>
+    <string name="app_subtitle">Argon Task Mode • Hexagon v73 HTP</string>
+    <string name="telemetry_soc_label">SoC</string>
+    <string name="telemetry_lpddr_label">LPDDR5X Footprint</string>
+    <string name="telemetry_vtcm_label">VTCM Ping-Pong Slot</string>
+    <string name="telemetry_context_label">NPU Context</string>
+    <string name="ref_template_title">Reference Template</string>
+    <string name="ref_template_subtitle">Layout Target (.docx / .pdf)</string>
+    <string name="source_content_title">Source Content</string>
+    <string name="source_content_subtitle">Text &amp; Data (.docx / .pdf)</string>
+    <string name="select_document">Select Document</string>
+    <string name="load_bundled_sample">Load Bundled Sample</string>
+    <string name="preview_layout">Preview Layout</string>
+    <string name="clone_layout_npu">Clone Layout on NPU</string>
+    <string name="re_run_clone_npu">Re-Run Clone on NPU</string>
+    <string name="stepper_header">ARGON 6-STAGE EXECUTION PIPELINE</string>
+    <string name="scorecard_header">BEFORE / AFTER SPLIT PREVIEW &amp; QA SCORECARD</string>
+    <string name="completeness_ratio">Completeness Ratio</string>
+    <string name="orphan_headings_repaired">Orphan Headings Repaired</string>
+    <string name="total_generated_pages">Total Generated Pages</string>
+    <string name="share_export_docx">Share / Export DOCX</string>
+    <string name="open_document">Open Document</string>
+</resources>

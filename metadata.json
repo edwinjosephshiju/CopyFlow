@@ -1,0 +1,6 @@
+{
+  "name": "CopyFlow",
+  "description": "Local on-device document layout cloning engine powered by Snapdragon 8 Gen 2 Hexagon v73 HTP NPU and OpenXML reconstruction.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
